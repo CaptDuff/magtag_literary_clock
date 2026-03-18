@@ -2,6 +2,8 @@
   "time_24h": true,
   "show_wifi_indicator": true,
   "font_size_quote": 38,
+  "font_size_quote_min": 18,
+  "quote_interval": 1,
   "font_size_time": 30,
   "font_size_meta": 22,
   "font_size_menu_title": 34,
@@ -13,5 +15,5 @@
   "btn_up": 6,
   "btn_down": 13,
   "btn_select": 19,
-  "time_offset_seconds": 82743
+  "time_offset_seconds": 0
 }

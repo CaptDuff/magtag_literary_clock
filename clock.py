@@ -185,19 +185,41 @@ def _init_quotes() -> None:
 
 
 def pick_quote(h: int, m: int) -> tuple:
+    """Return a quote for (h, m), respecting the quote_interval setting.
+
+    interval=1:  unique quote every minute. Exact matches used first; gaps
+                 filled from the full pool via a stable (h, m) hash.
+    interval=5:  snap to the nearest 5-minute bucket (classic literary clock).
+    interval=10: snap to the nearest 10-minute bucket.
+    """
+    interval = config.get("quote_interval") or 1
+
+    # Snap to bucket for 5/10 min modes
+    if interval in (5, 10):
+        m = (m // interval) * interval
+
     key = f"{h:02d}:{m:02d}"
     lst = QUOTES.get(key)
-    if not lst:
-        base = datetime.datetime(2000, 1, 1, h, m)
-        for delta in range(1, 31):
-            prev = base - datetime.timedelta(minutes=delta)
-            alt  = f"{prev.hour:02d}:{prev.minute:02d}"
-            lst  = QUOTES.get(alt)
-            if lst:
-                break
-    if not lst:
-        lst = next(iter(QUOTES.values()))
-    return lst[h % len(lst)]
+    if lst:
+        return lst[h % len(lst)]
+
+    if interval == 1:
+        # No exact match -- spread across the full pool, stable per (h, m)
+        all_quotes = [q for quotes in QUOTES.values() for q in quotes]
+        return all_quotes[(h * 60 + m) % len(all_quotes)]
+
+    # 5/10 min mode: walk back within the bucket to find the nearest entry
+    base = datetime.datetime(2000, 1, 1, h, m)
+    for delta in range(1, interval + 1):
+        prev = base - datetime.timedelta(minutes=delta)
+        alt  = f"{prev.hour:02d}:{prev.minute:02d}"
+        lst  = QUOTES.get(alt)
+        if lst:
+            return lst[h % len(lst)]
+
+    # Last resort
+    all_quotes = [q for quotes in QUOTES.values() for q in quotes]
+    return all_quotes[(h * 60 + m) % len(all_quotes)]
 
 
 def parse_spans(text: str) -> list:
@@ -337,6 +359,52 @@ def _next_button() -> str | None:
         return _btn_queue.get_nowait()
     except queue.Empty:
         return None
+
+
+def _setup_keyboard() -> None:
+    """
+    Feed keypresses into the same _btn_queue as GPIO buttons.
+    Works alongside physical buttons — both active at the same time.
+    Only runs when stdin is a real terminal (not when started by systemd).
+
+    Key map:
+      m / M        -> MENU
+      w / W        -> UP
+      s / S        -> DOWN
+      Enter/Space  -> SELECT
+      Ctrl+C       -> clean shutdown
+    """
+    import threading
+    import termios
+    import tty
+
+    if not sys.stdin.isatty():
+        return   # not a terminal (e.g. running as a systemd service)
+
+    def _read_keys():
+        fd  = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            while True:
+                ch = sys.stdin.read(1)
+                if ch in ("m", "M"):
+                    _btn_queue.put("MENU")
+                elif ch in ("w", "W"):
+                    _btn_queue.put("UP")
+                elif ch in ("s", "S"):
+                    _btn_queue.put("DOWN")
+                elif ch in ("\r", "\n", " "):
+                    _btn_queue.put("SELECT")
+                elif ch == "\x03":          # Ctrl+C
+                    os.kill(os.getpid(), signal.SIGINT)
+                    break
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+    t = threading.Thread(target=_read_keys, daemon=True)
+    t.start()
+    print("Keyboard: [m] menu  [w] up  [s] down  [Enter] select  [Ctrl+C] quit")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -665,6 +733,11 @@ def build_menu() -> Menu:
         ),
 
         MenuItem(
+            label  = lambda: f"Quote Interval: {config.get('quote_interval')} min",
+            action = _action_cycle_interval,
+        ),
+
+        MenuItem(
             label  = "Return to Clock",
             action = lambda: STATE_CLOCK,
         ),
@@ -679,6 +752,15 @@ def _action_ntp_sync():
         return MsgResult("No internet connection", "Check WiFi and try again.")
     sync_ntp()
     return MsgResult("Time synced", "Manual offset cleared.")
+
+
+def _action_cycle_interval():
+    """Cycle quote_interval through 1 -> 5 -> 10 -> 1."""
+    options = [1, 5, 10]
+    current = config.get("quote_interval") or 1
+    nxt = options[(options.index(current) + 1) % len(options)] if current in options else 1
+    config.set_val("quote_interval", nxt)
+    return None   # stay in menu; label updates automatically
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -714,6 +796,7 @@ def main() -> None:
     _reload_fonts()
     _init_quotes()
     _setup_buttons()
+    _setup_keyboard()
     _init_display()
 
     menu     = build_menu()

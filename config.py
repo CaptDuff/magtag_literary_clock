@@ -27,6 +27,13 @@ DEFAULTS: dict = {
     # ── Font sizes (px) ───────────────────────────────────────────────────────
     "font_size_quote":      38,     # main quote text (starting/maximum size)
     "font_size_quote_min":  18,     # minimum size before giving up shrinking
+
+    # ── Quote update interval ────────────────────────────────────────────────
+    # How often the quote changes. Must be 1, 5, or 10.
+    # 1  = unique quote every minute (uses full pool for gaps)
+    # 5  = quote changes every 5 minutes (classic literary clock behaviour)
+    # 10 = quote changes every 10 minutes
+    "quote_interval":       1,
     "font_size_time":       30,     # HH:MM on clock face
     "font_size_meta":       22,     # "Work — Author" attribution
     "font_size_menu_title": 34,     # menu header
