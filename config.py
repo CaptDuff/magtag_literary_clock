@@ -25,7 +25,8 @@ DEFAULTS: dict = {
     "show_wifi_indicator":  True,   # show WiFi icon on clock face
 
     # ── Font sizes (px) ───────────────────────────────────────────────────────
-    "font_size_quote":      38,     # main quote text
+    "font_size_quote":      38,     # main quote text (starting/maximum size)
+    "font_size_quote_min":  18,     # minimum size before giving up shrinking
     "font_size_time":       30,     # HH:MM on clock face
     "font_size_meta":       22,     # "Work — Author" attribution
     "font_size_menu_title": 34,     # menu header

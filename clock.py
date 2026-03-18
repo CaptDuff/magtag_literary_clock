@@ -60,7 +60,7 @@ STATE_MESSAGE = "message"  # brief status screen (auto-exits after MESSAGE_TTL s
 MESSAGE_TTL   = 2.5        # seconds to show a status message
 
 # ── CSV path ───────────────────────────────────────────────────────────────────
-CSV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "quotes_merged.csv")
+CSV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "quotes.csv")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -206,7 +206,10 @@ def parse_spans(text: str) -> list:
     return [(part, i % 2 == 1) for i, part in enumerate(parts) if part]
 
 
-def _wrap_spans(spans: list, draw: ImageDraw.ImageDraw, max_width: int) -> list:
+def _wrap_spans(spans: list, draw: ImageDraw.ImageDraw, max_width: int,
+                fnt_r: ImageFont.FreeTypeFont,
+                fnt_b: ImageFont.FreeTypeFont) -> list:
+    """Word-wrap (text, bold) spans into lines that fit max_width."""
     words = []
     for text, bold in spans:
         for w in text.split():
@@ -214,10 +217,10 @@ def _wrap_spans(spans: list, draw: ImageDraw.ImageDraw, max_width: int) -> list:
                 words.append((w, bold))
 
     lines, current, current_w = [], [], 0.0
-    space_w = draw.textlength(" ", font=fnt_quote)
+    space_w = draw.textlength(" ", font=fnt_r)
 
     for word, bold in words:
-        font   = fnt_bold if bold else fnt_quote
+        font   = fnt_b if bold else fnt_r
         word_w = draw.textlength(word, font=font)
         gap    = space_w if current else 0.0
         if current and (current_w + gap + word_w) > max_width:
@@ -232,22 +235,56 @@ def _wrap_spans(spans: list, draw: ImageDraw.ImageDraw, max_width: int) -> list:
 
 
 def _draw_quote(draw: ImageDraw.ImageDraw, spans: list,
-                x: int, y: int, max_width: int) -> int:
-    lines   = _wrap_spans(spans, draw, max_width)
-    bbox    = draw.textbbox((0, 0), "Agjy", font=fnt_quote)
+                x: int, y: int, max_width: int,
+                fnt_r=None, fnt_b=None) -> int:
+    """Draw word-wrapped quote. Returns y after the last line."""
+    fnt_r = fnt_r or fnt_quote
+    fnt_b = fnt_b or fnt_bold
+
+    lines   = _wrap_spans(spans, draw, max_width, fnt_r, fnt_b)
+    bbox    = draw.textbbox((0, 0), "Agjy", font=fnt_r)
     line_h  = bbox[3] - bbox[1] + LINE_SPACING
-    space_w = int(draw.textlength(" ", font=fnt_quote))
+    space_w = int(draw.textlength(" ", font=fnt_r))
 
     for line in lines:
         cx = x
         for i, (word, bold) in enumerate(line):
-            font = fnt_bold if bold else fnt_quote
+            font = fnt_b if bold else fnt_r
             draw.text((cx, y), word, font=font, fill=0)
             cx += int(draw.textlength(word, font=font))
             if i < len(line) - 1:
                 cx += space_w
         y += line_h
     return y
+
+
+def _fit_quote(draw: ImageDraw.ImageDraw, spans: list,
+               x: int, y: int, max_width: int, max_y: int):
+    """
+    Return (fnt_r, fnt_b) at the largest size where the quote fits within max_y.
+    Steps down by 2px per attempt.
+
+    Config keys:
+      font_size_quote      — starting (maximum) size
+      font_size_quote_min  — floor (default 18px)
+    """
+    start_size = config.get("font_size_quote")
+    min_size   = config.get("font_size_quote_min") or 18
+    step       = 2
+
+    for size in range(start_size, min_size - 1, -step):
+        fnt_r = _load_font(_SERIF,      size)
+        fnt_b = _load_font(_SERIF_BOLD, size)
+        lines  = _wrap_spans(spans, draw, max_width, fnt_r, fnt_b)
+        bbox   = draw.textbbox((0, 0), "Agjy", font=fnt_r)
+        line_h = bbox[3] - bbox[1] + LINE_SPACING
+        if y + len(lines) * line_h <= max_y:
+            if size < start_size:
+                print(f"  quote font shrunk: {start_size}px -> {size}px")
+            return fnt_r, fnt_b
+
+    # Hit the floor — return minimum and let it clip rather than crash
+    return _load_font(_SERIF, min_size), _load_font(_SERIF_BOLD, min_size)
 
 
 def fmt_time(h: int, m: int) -> str:
@@ -293,40 +330,6 @@ def _setup_buttons() -> None:
         print("RPi.GPIO not available — buttons disabled.")
     except RuntimeError as e:
         print(f"GPIO setup error: {e}")
-
-def _setup_keyboard() -> None:
-    """
-    Read single keypresses from stdin and feed them into _btn_queue.
-    Runs in a daemon thread — exits automatically when the main process does.
-
-    Key map:
-      m  →  MENU
-      w  →  UP
-      s  →  DOWN
-      Enter / Space  →  SELECT
-    """
-    import threading, termios, tty
-
-    def _read_keys():
-        fd   = sys.stdin.fileno()
-        old  = termios.tcgetattr(fd)
-        try:
-            tty.setraw(fd)
-            while True:
-                ch = sys.stdin.read(1)
-                if ch in ("m", "M"):     _btn_queue.put("MENU")
-                elif ch in ("w", "W"):   _btn_queue.put("UP")
-                elif ch in ("s", "S"):   _btn_queue.put("DOWN")
-                elif ch in ("\r", "\n", " "): _btn_queue.put("SELECT")
-                elif ch == "\x03":       # Ctrl+C
-                    os.kill(os.getpid(), signal.SIGINT)
-                    break
-        except Exception:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old)
-
-    t = threading.Thread(target=_read_keys, daemon=True)
-    t.start()
-    print("Keyboard input active: [m] menu  [w] up  [s] down  [Enter] select")
 
 
 def _next_button() -> str | None:
@@ -526,9 +529,16 @@ def render_clock(h: int, m: int) -> Image.Image:
     draw.line([(MARGIN, divider_y), (WIDTH - MARGIN, divider_y)],
               fill=0, width=1)
 
-    # Quote block
+    # Quote block — shrink font until text fits above the divider
     spans = parse_spans(quote_text)
-    _draw_quote(draw, spans, x=MARGIN, y=MARGIN, max_width=WIDTH - 2 * MARGIN)
+    fnt_r, fnt_b = _fit_quote(
+        draw, spans,
+        x=MARGIN, y=MARGIN,
+        max_width=WIDTH - 2 * MARGIN,
+        max_y=time_y - 20,
+    )
+    _draw_quote(draw, spans, x=MARGIN, y=MARGIN,
+                max_width=WIDTH - 2 * MARGIN, fnt_r=fnt_r, fnt_b=fnt_b)
 
     return img
 
@@ -704,7 +714,6 @@ def main() -> None:
     _reload_fonts()
     _init_quotes()
     _setup_buttons()
-    _setup_keyboard()
     _init_display()
 
     menu     = build_menu()
