@@ -1,0 +1,36 @@
+# literary-clock.service
+#
+# Starts the literary clock automatically on boot.
+#
+# INSTALL:
+#   sudo cp literary-clock.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable literary-clock
+#   sudo systemctl start literary-clock
+#
+# USEFUL COMMANDS:
+#   sudo systemctl status literary-clock    # check status
+#   sudo journalctl -u literary-clock -f    # live logs
+#   sudo systemctl restart literary-clock   # restart after code changes
+#   sudo systemctl stop literary-clock      # stop (ctrl+C alternative)
+
+[Unit]
+Description=Literary Clock (Waveshare e-ink)
+# Wait for network so NTP has time to sync and WiFi check works
+After=network-online.target time-sync.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=clock
+WorkingDirectory=/home/clock/dev/magtag_literary_clock
+ExecStart=/usr/bin/python3 /home/clock/dev/magtag_literary_clock/clock.py
+Restart=on-failure
+RestartSec=10
+
+# Log to journald (readable with: sudo journalctl -u literary-clock -f)
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

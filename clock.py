@@ -1,107 +1,150 @@
 #!/usr/bin/env python3
 """
-Raspberry Pi + Waveshare 7.5" e-ink (800×480) Literary Quote Clock
-Port of Adafruit MagTag CircuitPython version → Python 3 / RPi / Pillow
+Literary Clock — Raspberry Pi + Waveshare 7.5" e-ink (800×480)
 
-Hardware:
-  - Raspberry Pi (any model with SPI)
-  - Waveshare 7.5" e-ink HAT V2 (800×480, black/white)
-    Connects directly to the 40-pin GPIO header.
+Starts in clock mode. Four buttons navigate a menu for time adjustment,
+NTP sync, and display toggles.
 
-Software dependencies:
-  pip install Pillow RPi.GPIO
-  Waveshare EPD library — clone into ./lib/:
-    git clone https://github.com/waveshare/e-Paper
-    cp -r e-Paper/RaspberryPi_JetsonNano/python/lib ./lib
+Button wiring (BCM pins — configure in config.json):
+  btn_menu   (default 5)  — open menu / cancel / back
+  btn_up     (default 6)  — navigate up / increment
+  btn_down   (default 13) — navigate down / decrement
+  btn_select (default 19) — confirm / select
 
-CSV format (pipe-delimited, same file as MagTag version):
-  hhmm|quote with ^bold span^|Work Title|Author|tag
+Wire each button between the GPIO pin and GND.
+Internal pull-ups enabled — no resistors needed.
 
-Bold spans are rendered in a heavier font weight — same visual idea as
-the MagTag faux-bold (double-draw) trick, just done properly with PIL.
+Systemd service: see literary-clock.service in this directory.
 """
 
-import time
 import datetime
 import os
-import sys
+import queue
 import signal
+import socket
+import sys
+import time
 
 from PIL import Image, ImageDraw, ImageFont
 
-# ─── Waveshare library path ───────────────────────────────────────────────────
-# Expects the waveshare_epd package at ./lib/waveshare_epd/
-LIB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib")
-if LIB_DIR not in sys.path:
-    sys.path.insert(0, LIB_DIR)
+import config
+from menu import Menu, MenuItem, MsgResult
+
+# ── Waveshare library ──────────────────────────────────────────────────────────
+_LIB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib")
+if _LIB_DIR not in sys.path:
+    sys.path.insert(0, _LIB_DIR)
 
 try:
     from waveshare_epd import epd7in5_V2
     EPD_AVAILABLE = True
 except ImportError:
     EPD_AVAILABLE = False
-    print("⚠  waveshare_epd not found — running in PREVIEW MODE (saves PNG to /tmp/)")
+    print("⚠  waveshare_epd not found — PREVIEW MODE (PNG → /tmp/literary_clock_preview.png)")
 
-# ─── Configuration ────────────────────────────────────────────────────────────
+# ── Layout constants ───────────────────────────────────────────────────────────
+WIDTH,  HEIGHT  = 800, 480
+MARGIN          = 36
+LINE_SPACING    = 10
+HEADER_H        = 60    # menu / set-time header bar height
+FOOTER_H        = 46    # menu / set-time footer bar height
+MENU_ITEM_H     = 58    # height of each menu row
 
-CSV_PATH    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "quotes.csv")
+# ── Application states ─────────────────────────────────────────────────────────
+STATE_CLOCK   = "clock"
+STATE_MENU    = "menu"
+STATE_SET_H   = "set_h"    # time-set screen, editing hours
+STATE_SET_M   = "set_m"    # time-set screen, editing minutes
+STATE_MESSAGE = "message"  # brief status screen (auto-exits after MESSAGE_TTL s)
 
-# Fonts — DejaVu ships with Raspberry Pi OS; adjust paths if needed.
-# Download a nicer serif (e.g. Libre Baskerville) for a more book-like look.
-FONT_REGULAR = "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf"
-FONT_BOLD    = "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf"
-FONT_ITALIC  = "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Italic.ttf"
+MESSAGE_TTL   = 2.5        # seconds to show a status message
 
-FONT_SIZE_QUOTE = 38   # main quote text
-FONT_SIZE_TIME  = 30   # HH:MM in bottom corner
-FONT_SIZE_META  = 22   # "Work — Author" attribution
+# ── CSV path ───────────────────────────────────────────────────────────────────
+CSV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "quotes_merged.csv")
 
-WIDTH   = 800
-HEIGHT  = 480
-MARGIN  = 36           # px padding on all sides
-LINE_SPACING = 10      # extra px between wrapped lines
 
-# E-ink ghosting management:
-# Run a full (slow, ghost-clearing) refresh every N updates,
-# fast refresh the rest of the time.
-FULL_REFRESH_EVERY = 8
+# ═══════════════════════════════════════════════════════════════════════════════
+# FONT LOADING
+# ═══════════════════════════════════════════════════════════════════════════════
+# Candidates searched in order — first existing file wins.
+# Drop a TTF into ./fonts/ to override system fonts.
 
-# How often to check if the minute has changed (seconds).
-# Lower = more responsive to button presses; higher = less CPU churn.
-POLL_INTERVAL = 10
+_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# ─── Optional GPIO time-adjustment buttons ────────────────────────────────────
-# Set BCM pin numbers for physical buttons wired to your Pi, or leave as None.
-# Buttons should connect the pin to GND when pressed (internal pull-up enabled).
-# On the Pi these are purely optional — the system clock is set by NTP.
-# Use them if you want a manual offset (e.g. displaying a different timezone).
-BTN_HOUR_UP   = None   # e.g. 17  →  +1 hour
-BTN_HOUR_DOWN = None   # e.g. 27  →  -1 hour
-BTN_MIN_UP    = None   # e.g. 22  →  +1 minute
-BTN_MIN_DOWN  = None   # e.g. 23  →  -1 minute
+_SERIF = [
+    os.path.join(_DIR, "fonts", "serif.ttf"),
+    "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+    "/usr/share/fonts/truetype/freefont/FreeSerif.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
+    "/System/Library/Fonts/Supplemental/Georgia.ttf",
+    "/Library/Fonts/Georgia.ttf",
+]
+_SERIF_BOLD = [
+    os.path.join(_DIR, "fonts", "serif-bold.ttf"),
+    "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
+    "/usr/share/fonts/truetype/freefont/FreeSerifBold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf",
+    "/System/Library/Fonts/Supplemental/Georgia Bold.ttf",
+]
+_SERIF_ITALIC = [
+    os.path.join(_DIR, "fonts", "serif-italic.ttf"),
+    "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Italic.ttf",
+    "/usr/share/fonts/truetype/freefont/FreeSerifItalic.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSerif-Italic.ttf",
+    "/System/Library/Fonts/Supplemental/Georgia Italic.ttf",
+]
 
-# ─── Font loading ─────────────────────────────────────────────────────────────
 
-def load_font(path: str, size: int) -> ImageFont.FreeTypeFont:
-    try:
-        return ImageFont.truetype(path, size)
-    except (IOError, OSError):
-        print(f"  Font not found: {path} — falling back to PIL default")
-        return ImageFont.load_default()
+def _find_font(candidates: list) -> str | None:
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    import glob
+    for pat in ["/usr/share/fonts/**/*.ttf", "/usr/share/fonts/**/*.otf"]:
+        found = sorted(glob.glob(pat, recursive=True))
+        if found:
+            return found[0]
+    return None
 
-fnt_quote  = load_font(FONT_REGULAR, FONT_SIZE_QUOTE)
-fnt_bold   = load_font(FONT_BOLD,    FONT_SIZE_QUOTE)
-fnt_time   = load_font(FONT_BOLD,    FONT_SIZE_TIME)
-fnt_meta   = load_font(FONT_ITALIC,  FONT_SIZE_META)
 
-# ─── CSV loader ───────────────────────────────────────────────────────────────
+def _load_font(candidates: list, size: int) -> ImageFont.FreeTypeFont:
+    path = _find_font(candidates)
+    if path:
+        try:
+            font = ImageFont.truetype(path, size)
+            print(f"  font: {os.path.basename(path)} @ {size}px")
+            return font
+        except (IOError, OSError):
+            pass
+    print(f"  ⚠ font not found — PIL bitmap fallback @ {size}px")
+    return ImageFont.load_default()
 
-def load_quotes(path: str) -> dict:
-    """
-    Returns dict: {'HH:MM': [(quote_with_carets, work, author, tag), …]}
-    Handles the slightly malformed rows in the original CSV (outer quotes,
-    trailing commas from spreadsheet export, etc.).
-    """
+
+def _reload_fonts() -> None:
+    """Load (or reload) all fonts from config sizes. Called at startup."""
+    global fnt_quote, fnt_bold, fnt_time, fnt_meta
+    global fnt_menu_title, fnt_menu_item, fnt_menu_hint, fnt_settime
+
+    fnt_quote      = _load_font(_SERIF,        config.get("font_size_quote"))
+    fnt_bold       = _load_font(_SERIF_BOLD,   config.get("font_size_quote"))
+    fnt_time       = _load_font(_SERIF_BOLD,   config.get("font_size_time"))
+    fnt_meta       = _load_font(_SERIF_ITALIC, config.get("font_size_meta"))
+    fnt_menu_title = _load_font(_SERIF_BOLD,   config.get("font_size_menu_title"))
+    fnt_menu_item  = _load_font(_SERIF,        config.get("font_size_menu_item"))
+    fnt_menu_hint  = _load_font(_SERIF_ITALIC, config.get("font_size_menu_hint"))
+    fnt_settime    = _load_font(_SERIF_BOLD,   config.get("font_size_settime"))
+
+
+# Initialised as None — _reload_fonts() sets them at startup
+fnt_quote = fnt_bold = fnt_time = fnt_meta = None
+fnt_menu_title = fnt_menu_item = fnt_menu_hint = fnt_settime = None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# QUOTE LOADING + TEXT HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _load_quotes(path: str) -> dict:
     mapping: dict = {}
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -117,93 +160,82 @@ def load_quotes(path: str) -> dict:
                 work   = parts[2].strip() if len(parts) > 2 else ""
                 author = parts[3].strip() if len(parts) > 3 else ""
                 tag    = parts[4].strip() if len(parts) > 4 else ""
-
-                # Normalise hhmm → 'HH:MM'
                 digits = hhmm.replace(":", "")
                 if len(digits) == 3:
                     digits = "0" + digits
                 if len(digits) == 4:
                     hhmm = f"{digits[:2]}:{digits[2:]}"
-
                 if len(hhmm) == 5 and hhmm[2] == ":":
                     mapping.setdefault(hhmm, []).append((quote, work, author, tag))
-    except (OSError, FileNotFoundError) as exc:
-        print(f"Could not load quotes from {path}: {exc}")
+    except (OSError, FileNotFoundError) as e:
+        print(f"Could not load quotes: {e}")
     return mapping
 
 
-QUOTES = load_quotes(CSV_PATH)
-print(f"Loaded {sum(len(v) for v in QUOTES.values())} quotes across {len(QUOTES)} minutes.")
+QUOTES: dict = {}
 
-if not QUOTES:
-    QUOTES = {"12:00": [("It is ^now^. The clock has no other wisdom to offer.", "Literary Clock", "System", "")]}
 
-# ─── Bold-span parsing ────────────────────────────────────────────────────────
+def _init_quotes() -> None:
+    global QUOTES
+    QUOTES = _load_quotes(CSV_PATH)
+    print(f"Loaded {sum(len(v) for v in QUOTES.values())} quotes "
+          f"across {len(QUOTES)} minutes.")
+    if not QUOTES:
+        QUOTES = {"12:00": [("It is ^now^.", "Literary Clock", "System", "")]}
 
-def parse_spans(text: str) -> list[tuple[str, bool]]:
-    """
-    Split 'some ^highlighted^ text' into [(str, is_bold), …].
-    Strips any unmatched carets.
-    """
+
+def pick_quote(h: int, m: int) -> tuple:
+    key = f"{h:02d}:{m:02d}"
+    lst = QUOTES.get(key)
+    if not lst:
+        base = datetime.datetime(2000, 1, 1, h, m)
+        for delta in range(1, 31):
+            prev = base - datetime.timedelta(minutes=delta)
+            alt  = f"{prev.hour:02d}:{prev.minute:02d}"
+            lst  = QUOTES.get(alt)
+            if lst:
+                break
+    if not lst:
+        lst = next(iter(QUOTES.values()))
+    return lst[h % len(lst)]
+
+
+def parse_spans(text: str) -> list:
+    """Split 'some ^bold^ text' into [(str, is_bold), ...]."""
     parts = text.split("^")
     return [(part, i % 2 == 1) for i, part in enumerate(parts) if part]
 
-# ─── Word-wrap with mixed bold/normal spans ───────────────────────────────────
 
-def wrap_spans(
-    spans: list[tuple[str, bool]],
-    draw: ImageDraw.ImageDraw,
-    max_width: int,
-) -> list[list[tuple[str, bool]]]:
-    """
-    Word-wrap a list of (text, bold) spans into lines that fit max_width.
-    Returns a list of lines; each line is a list of (word, bold) pairs.
-    """
-    words: list[tuple[str, bool]] = []
+def _wrap_spans(spans: list, draw: ImageDraw.ImageDraw, max_width: int) -> list:
+    words = []
     for text, bold in spans:
-        # Split on whitespace but keep the bold flag per word
         for w in text.split():
             if w:
                 words.append((w, bold))
 
-    lines: list[list[tuple[str, bool]]] = []
-    current: list[tuple[str, bool]] = []
-    current_w: float = 0.0
-
+    lines, current, current_w = [], [], 0.0
     space_w = draw.textlength(" ", font=fnt_quote)
 
     for word, bold in words:
-        font = fnt_bold if bold else fnt_quote
+        font   = fnt_bold if bold else fnt_quote
         word_w = draw.textlength(word, font=font)
         gap    = space_w if current else 0.0
         if current and (current_w + gap + word_w) > max_width:
             lines.append(current)
-            current   = [(word, bold)]
-            current_w = word_w
+            current, current_w = [(word, bold)], word_w
         else:
             current.append((word, bold))
             current_w += gap + word_w
-
     if current:
         lines.append(current)
-
     return lines
 
 
-def draw_quote_text(
-    draw: ImageDraw.ImageDraw,
-    spans: list[tuple[str, bool]],
-    x: int,
-    y: int,
-    max_width: int,
-) -> int:
-    """Draw word-wrapped quote. Returns the y coordinate after the last line."""
-    lines = wrap_spans(spans, draw, max_width)
-
-    # Use a consistent line height regardless of bold/normal mix
-    bbox = draw.textbbox((0, 0), "Ágjy", font=fnt_quote)
-    line_h = bbox[3] - bbox[1] + LINE_SPACING
-
+def _draw_quote(draw: ImageDraw.ImageDraw, spans: list,
+                x: int, y: int, max_width: int) -> int:
+    lines   = _wrap_spans(spans, draw, max_width)
+    bbox    = draw.textbbox((0, 0), "Agjy", font=fnt_quote)
+    line_h  = bbox[3] - bbox[1] + LINE_SPACING
     space_w = int(draw.textlength(" ", font=fnt_quote))
 
     for line in lines:
@@ -215,195 +247,606 @@ def draw_quote_text(
             if i < len(line) - 1:
                 cx += space_w
         y += line_h
-
     return y
 
-# ─── Quote selection ──────────────────────────────────────────────────────────
 
-def pick_quote(h: int, m: int) -> tuple:
-    """Pick a quote for (h, m). Falls back to nearest earlier minute if missing."""
-    key = f"{h:02d}:{m:02d}"
-    lst = QUOTES.get(key)
+def fmt_time(h: int, m: int) -> str:
+    if config.get("time_24h"):
+        return f"{h:02d}:{m:02d}"
+    period = "AM" if h < 12 else "PM"
+    return f"{h % 12 or 12}:{m:02d} {period}"
 
-    if not lst:
-        # Walk back up to 30 minutes to find the nearest entry
-        base = datetime.datetime(2000, 1, 1, h, m)
-        for delta in range(1, 31):
-            prev = base - datetime.timedelta(minutes=delta)
-            alt  = f"{prev.hour:02d}:{prev.minute:02d}"
-            lst  = QUOTES.get(alt)
-            if lst:
-                break
 
-    if not lst:
-        # Last resort — any random quote from the collection
-        lst = next(iter(QUOTES.values()))
+# ═══════════════════════════════════════════════════════════════════════════════
+# BUTTON SETUP  (interrupt-driven — responsive even during display updates)
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    # Rotate by hour so multiple quotes per minute stay varied
-    return lst[h % len(lst)]
+_btn_queue: queue.SimpleQueue = queue.SimpleQueue()
+_gpio_ok = False
 
-# ─── Frame renderer ───────────────────────────────────────────────────────────
 
-def render_frame(h: int, m: int) -> Image.Image:
-    """Render a complete 800×480 1-bit image for the given time."""
+def _setup_buttons() -> None:
+    global _gpio_ok
+    pins = {
+        "MENU":   config.get("btn_menu"),
+        "UP":     config.get("btn_up"),
+        "DOWN":   config.get("btn_down"),
+        "SELECT": config.get("btn_select"),
+    }
+    active = {name: pin for name, pin in pins.items() if pin is not None}
+    if not active:
+        print("No buttons configured (all btn_* are null in config.json).")
+        return
+    try:
+        import RPi.GPIO as GPIO
+        GPIO.setmode(GPIO.BCM)
+        for name, pin in active.items():
+            GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+            GPIO.add_event_detect(
+                pin, GPIO.FALLING,
+                callback=lambda ch, n=name: _btn_queue.put(n),
+                bouncetime=300,
+            )
+        _gpio_ok = True
+        print(f"Buttons registered: {active}")
+    except ImportError:
+        print("RPi.GPIO not available — buttons disabled.")
+    except RuntimeError as e:
+        print(f"GPIO setup error: {e}")
+
+def _setup_keyboard() -> None:
+    """
+    Read single keypresses from stdin and feed them into _btn_queue.
+    Runs in a daemon thread — exits automatically when the main process does.
+
+    Key map:
+      m  →  MENU
+      w  →  UP
+      s  →  DOWN
+      Enter / Space  →  SELECT
+    """
+    import threading, termios, tty
+
+    def _read_keys():
+        fd   = sys.stdin.fileno()
+        old  = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            while True:
+                ch = sys.stdin.read(1)
+                if ch in ("m", "M"):     _btn_queue.put("MENU")
+                elif ch in ("w", "W"):   _btn_queue.put("UP")
+                elif ch in ("s", "S"):   _btn_queue.put("DOWN")
+                elif ch in ("\r", "\n", " "): _btn_queue.put("SELECT")
+                elif ch == "\x03":       # Ctrl+C
+                    os.kill(os.getpid(), signal.SIGINT)
+                    break
+        except Exception:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+    t = threading.Thread(target=_read_keys, daemon=True)
+    t.start()
+    print("Keyboard input active: [m] menu  [w] up  [s] down  [Enter] select")
+
+
+def _next_button() -> str | None:
+    try:
+        return _btn_queue.get_nowait()
+    except queue.Empty:
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# NETWORK UTILITIES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_wifi_cache: tuple = (False, 0.0)
+_WIFI_TTL = 30.0
+
+
+def is_connected() -> bool:
+    """Return True if internet is reachable (cached for _WIFI_TTL seconds)."""
+    global _wifi_cache
+    connected, ts = _wifi_cache
+    if time.monotonic() - ts < _WIFI_TTL:
+        return connected
+    try:
+        socket.create_connection(("8.8.8.8", 53), timeout=3).close()
+        connected = True
+    except OSError:
+        connected = False
+    _wifi_cache = (connected, time.monotonic())
+    return connected
+
+
+def invalidate_wifi_cache() -> None:
+    global _wifi_cache
+    _wifi_cache = (False, 0.0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TIME UTILITIES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def get_display_time() -> tuple:
+    """Return (hour, minute) adjusted by any stored manual offset."""
+    offset = datetime.timedelta(seconds=config.get("time_offset_seconds") or 0)
+    now    = datetime.datetime.now() + offset
+    return now.hour, now.minute
+
+
+def apply_manual_time(h: int, m: int) -> None:
+    """
+    Store a time offset so the display shows h:m right now.
+    The system clock is NOT modified — no sudo required.
+    """
+    now    = datetime.datetime.now()
+    target = now.replace(hour=h, minute=m, second=0, microsecond=0)
+    diff   = (target - now).total_seconds()
+    if diff < -1800:
+        target += datetime.timedelta(days=1)
+    config.set_val("time_offset_seconds", int((target - now).total_seconds()))
+
+
+def sync_ntp() -> None:
+    """Reset manual time offset — trusts the Pi's NTP-synced system clock."""
+    config.set_val("time_offset_seconds", 0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DISPLAY INTERFACE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_epd           = None
+_refresh_count = 0
+
+
+def _init_display() -> None:
+    global _epd
+    if not EPD_AVAILABLE:
+        return
+    print("Initialising Waveshare EPD...")
+    _epd = epd7in5_V2.EPD()
+    _epd.init()
+    _epd.Clear()
+    print("Display ready.")
+
+
+def _show(img: Image.Image, fast: bool = False) -> None:
+    """
+    Send img to the display.
+    fast=True  -> try init_fast() for quicker menu updates.
+    fast=False -> honour full_refresh_every for ghost clearing.
+    """
+    global _refresh_count
+
+    use_full = (not fast) and (_refresh_count % config.get("full_refresh_every") == 0)
+
+    if not EPD_AVAILABLE:
+        img.save("/tmp/literary_clock_preview.png")
+        mode = "fast" if fast else ("full" if use_full else "std")
+        print(f"  [preview] /tmp/literary_clock_preview.png  [{mode}]")
+        _refresh_count += 1
+        return
+
+    assert _epd is not None
+    if fast:
+        try:
+            _epd.init_fast()
+        except AttributeError:
+            _epd.init()
+    else:
+        _epd.init()
+
+    _epd.display(_epd.getbuffer(img))
+    _refresh_count += 1
+    mode = "fast" if fast else ("full" if use_full else "std")
+    print(f"  display updated #{_refresh_count} [{mode}]")
+
+
+def _sleep_display() -> None:
+    if _epd and EPD_AVAILABLE:
+        _epd.sleep()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DRAWING HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _draw_wifi_icon(draw: ImageDraw.ImageDraw,
+                    x: int, y: int, connected: bool) -> None:
+    """
+    Draw a 28x24 WiFi icon at (x, y) top-left.
+    Connected:    dot + 3 arcs
+    Disconnected: dot + 1 arc + small x overlay
+    """
+    cx = x + 14
+    by = y + 24
+
+    r = 3
+    draw.ellipse([cx - r, by - r * 2, cx + r, by], fill=0)
+
+    for radius, show in [(7, True), (13, connected), (19, connected)]:
+        if show:
+            box = [cx - radius, by - radius, cx + radius, by + radius]
+            draw.arc(box, start=225, end=315, fill=0, width=2)
+
+    if not connected:
+        ox, oy = x + 20, y + 2
+        draw.line([(ox, oy), (ox + 7, oy + 7)], fill=0, width=2)
+        draw.line([(ox + 7, oy), (ox, oy + 7)], fill=0, width=2)
+
+
+def _menu_header(draw: ImageDraw.ImageDraw, title: str) -> None:
+    draw.rectangle([0, 0, WIDTH, HEADER_H], fill=0)
+    draw.text((MARGIN, HEADER_H // 2), f"  {title}",
+              font=fnt_menu_title, fill=255, anchor="lm")
+
+
+def _menu_footer(draw: ImageDraw.ImageDraw, hints: str) -> None:
+    draw.line([(0, HEIGHT - FOOTER_H), (WIDTH, HEIGHT - FOOTER_H)], fill=0, width=1)
+    draw.text((MARGIN, HEIGHT - FOOTER_H // 2), hints,
+              font=fnt_menu_hint, fill=0, anchor="lm")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RENDER FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def render_clock(h: int, m: int) -> Image.Image:
+    """Render the main clock face."""
     quote_text, work, author, _tag = pick_quote(h, m)
 
-    img  = Image.new("1", (WIDTH, HEIGHT), 255)  # white background
+    img  = Image.new("1", (WIDTH, HEIGHT), 255)
     draw = ImageDraw.Draw(img)
 
-    # ── Bottom strip: time + attribution ──────────────────────────────────────
-    time_str = f"{h:02d}:{m:02d}"
-    meta_str = f"{work}  —  {author}" if (work and author) else work or author
+    # WiFi indicator — top-right corner, tucked inside the margin
+    if config.get("show_wifi_indicator"):
+        _draw_wifi_icon(draw, WIDTH - MARGIN - 28, 8, is_connected())
+
+    # Bottom strip: time + rule + attribution
+    time_str = fmt_time(h, m)
+    meta_str = (f"{work}  \u2014  {author}" if (work and author)
+                else work or author or "")
 
     meta_bbox = draw.textbbox((0, 0), meta_str or "X", font=fnt_meta)
+    time_bbox = draw.textbbox((0, 0), time_str,         font=fnt_time)
     meta_h    = meta_bbox[3] - meta_bbox[1]
-    time_bbox = draw.textbbox((0, 0), time_str, font=fnt_time)
     time_h    = time_bbox[3] - time_bbox[1]
 
     meta_y    = HEIGHT - MARGIN - meta_h
     divider_y = meta_y - 12
     time_y    = divider_y - 10 - time_h
-    quote_max_y = time_y - 20  # quote block must not exceed this
 
-    # Draw time (left-aligned)
     draw.text((MARGIN, time_y), time_str, font=fnt_time, fill=0)
-
-    # Draw attribution (right-aligned for a typographic touch)
     if meta_str:
-        meta_w = draw.textlength(meta_str, font=fnt_meta)
-        draw.text((WIDTH - MARGIN - meta_w, meta_y), meta_str, font=fnt_meta, fill=0)
+        meta_w = int(draw.textlength(meta_str, font=fnt_meta))
+        draw.text((WIDTH - MARGIN - meta_w, meta_y), meta_str,
+                  font=fnt_meta, fill=0)
+    draw.line([(MARGIN, divider_y), (WIDTH - MARGIN, divider_y)],
+              fill=0, width=1)
 
-    # Thin rule above time/meta area
-    draw.line([(MARGIN, divider_y), (WIDTH - MARGIN, divider_y)], fill=0, width=1)
-
-    # ── Quote block ───────────────────────────────────────────────────────────
+    # Quote block
     spans = parse_spans(quote_text)
-    draw_quote_text(
-        draw, spans,
-        x=MARGIN, y=MARGIN,
-        max_width=WIDTH - 2 * MARGIN,
-    )
+    _draw_quote(draw, spans, x=MARGIN, y=MARGIN, max_width=WIDTH - 2 * MARGIN)
 
     return img
 
-# ─── E-ink display interface ─────────────────────────────────────────────────
 
-epd          = None
-_refresh_count = 0
+def render_menu(menu: Menu) -> Image.Image:
+    """Render the menu overlay."""
+    img  = Image.new("1", (WIDTH, HEIGHT), 255)
+    draw = ImageDraw.Draw(img)
 
-def init_display():
-    global epd
-    if not EPD_AVAILABLE:
-        return
-    print("Initialising Waveshare EPD…")
-    epd = epd7in5_V2.EPD()
-    epd.init()
-    epd.Clear()
-    print("Display ready.")
+    _menu_header(draw, menu.title)
+    _menu_footer(draw, "UP   DOWN   OK SELECT   BACK")
+
+    items   = menu.items
+    y_start = HEADER_H + 14
+    y_max   = HEIGHT - FOOTER_H - 8
+
+    for i, item in enumerate(items):
+        iy = y_start + i * MENU_ITEM_H
+        if iy + MENU_ITEM_H > y_max:
+            break
+
+        selected = (i == menu.cursor)
+        if selected:
+            draw.rectangle(
+                [MARGIN // 2, iy + 2, WIDTH - MARGIN // 2, iy + MENU_ITEM_H - 2],
+                fill=0,
+            )
+            draw.text((MARGIN * 2, iy + MENU_ITEM_H // 2), item.label,
+                      font=fnt_menu_item, fill=255, anchor="lm")
+        else:
+            draw.text((MARGIN * 2, iy + MENU_ITEM_H // 2), item.label,
+                      font=fnt_menu_item, fill=0, anchor="lm")
+
+    return img
 
 
-def show_image(img: Image.Image, force_full: bool = False):
-    """Send an image to the display (full or fast refresh)."""
-    global _refresh_count
-    use_full = force_full or (_refresh_count % FULL_REFRESH_EVERY == 0)
+def render_time_set(h: int, m: int, field: str) -> Image.Image:
+    """
+    Render the manual time-set screen.
+    field: 'h' highlights hours, 'm' highlights minutes.
+    """
+    img  = Image.new("1", (WIDTH, HEIGHT), 255)
+    draw = ImageDraw.Draw(img)
 
-    if not EPD_AVAILABLE:
-        preview_path = "/tmp/literary_clock_preview.png"
-        img.save(preview_path)
-        print(f"  [preview] saved → {preview_path}  ({'full' if use_full else 'fast'})")
-        _refresh_count += 1
-        return
+    _menu_header(draw, "SET TIME")
+    hint = ("UP/DOWN Adjust hour    OK Next    BACK Cancel" if field == "h"
+            else "UP/DOWN Adjust minute    OK Save    BACK Cancel")
+    _menu_footer(draw, hint)
 
-    assert epd is not None
-    if use_full:
-        epd.init()
+    h_str, m_str, colon = f"{h:02d}", f"{m:02d}", ":"
+
+    h_w = int(draw.textlength(h_str,  font=fnt_settime))
+    m_w = int(draw.textlength(m_str,  font=fnt_settime))
+    c_w = int(draw.textlength(colon,  font=fnt_settime))
+    PAD = 18
+    tot = h_w + c_w + m_w + PAD * 2
+
+    bbox    = draw.textbbox((0, 0), h_str, font=fnt_settime)
+    digit_h = bbox[3] - bbox[1]
+    cy      = (HEIGHT + HEADER_H - FOOTER_H) // 2
+    y       = cy - digit_h // 2
+
+    h_x = WIDTH // 2 - tot // 2
+    c_x = h_x + h_w + PAD
+    m_x = c_x + c_w + PAD
+    BP  = 10
+
+    if field == "h":
+        draw.rectangle([h_x-BP, y-BP, h_x+h_w+BP, y+digit_h+BP], fill=0)
+        draw.text((h_x, y), h_str, font=fnt_settime, fill=255)
     else:
-        epd.init_fast()
+        draw.text((h_x, y), h_str, font=fnt_settime, fill=0)
 
-    epd.display(epd.getbuffer(img))
-    _refresh_count += 1
-    print(f"  display updated (refresh #{_refresh_count}, {'full' if use_full else 'fast'})")
+    draw.text((c_x, y), colon, font=fnt_settime, fill=0)
 
+    if field == "m":
+        draw.rectangle([m_x-BP, y-BP, m_x+m_w+BP, y+digit_h+BP], fill=0)
+        draw.text((m_x, y), m_str, font=fnt_settime, fill=255)
+    else:
+        draw.text((m_x, y), m_str, font=fnt_settime, fill=0)
 
-def sleep_display():
-    if epd and EPD_AVAILABLE:
-        epd.sleep()
-
-# ─── Optional GPIO buttons ────────────────────────────────────────────────────
-
-_gpio_ok      = False
-_time_offset  = datetime.timedelta()
-
-_btn_pins = [p for p in [BTN_HOUR_UP, BTN_HOUR_DOWN, BTN_MIN_UP, BTN_MIN_DOWN] if p is not None]
-
-if _btn_pins:
-    try:
-        import RPi.GPIO as GPIO
-        GPIO.setmode(GPIO.BCM)
-        for pin in _btn_pins:
-            GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-        _gpio_ok = True
-        print(f"GPIO buttons enabled on pins: {_btn_pins}")
-    except ImportError:
-        print("RPi.GPIO not available — buttons disabled.")
+    return img
 
 
-def read_buttons():
-    """Check buttons, adjust _time_offset, debounce with short sleep."""
-    global _time_offset
-    if not _gpio_ok:
-        return
-    import RPi.GPIO as GPIO
-    if BTN_HOUR_UP   and not GPIO.input(BTN_HOUR_UP):
-        _time_offset += datetime.timedelta(hours=1);   time.sleep(0.35)
-    if BTN_HOUR_DOWN and not GPIO.input(BTN_HOUR_DOWN):
-        _time_offset -= datetime.timedelta(hours=1);   time.sleep(0.35)
-    if BTN_MIN_UP    and not GPIO.input(BTN_MIN_UP):
-        _time_offset += datetime.timedelta(minutes=1); time.sleep(0.35)
-    if BTN_MIN_DOWN  and not GPIO.input(BTN_MIN_DOWN):
-        _time_offset -= datetime.timedelta(minutes=1); time.sleep(0.35)
+def render_message(text: str, subtext: str = "") -> Image.Image:
+    """Render a brief centred status message."""
+    img  = Image.new("1", (WIDTH, HEIGHT), 255)
+    draw = ImageDraw.Draw(img)
+    cy   = HEIGHT // 2
+    draw.text((WIDTH // 2, cy - 22), text,
+              font=fnt_menu_item, fill=0, anchor="mm")
+    if subtext:
+        draw.text((WIDTH // 2, cy + 22), subtext,
+                  font=fnt_menu_hint, fill=0, anchor="mm")
+    return img
 
 
-def get_display_time() -> tuple[int, int]:
-    now = datetime.datetime.now() + _time_offset
-    return now.hour, now.minute
+# ═══════════════════════════════════════════════════════════════════════════════
+# MENU BUILDER
+# ═══════════════════════════════════════════════════════════════════════════════
 
-# ─── Graceful shutdown ────────────────────────────────────────────────────────
+def build_menu() -> Menu:
+    """
+    ──────────────────────────────────────────────────────────────────────────
+    ADD NEW MENU ITEMS HERE.
+    See menu.py for full documentation on MenuItem parameters and return values.
+    ──────────────────────────────────────────────────────────────────────────
+    """
+    return Menu("MENU", [
+
+        MenuItem(
+            label  = "Set Time Manually",
+            action = lambda: STATE_SET_H,
+        ),
+
+        MenuItem(
+            label  = "Sync Time via NTP",
+            action = _action_ntp_sync,
+        ),
+
+        MenuItem(
+            label  = lambda: f"WiFi Indicator: {'ON' if config.get('show_wifi_indicator') else 'OFF'}",
+            action = lambda: (config.toggle("show_wifi_indicator"), None)[1],
+        ),
+
+        MenuItem(
+            label  = "Return to Clock",
+            action = lambda: STATE_CLOCK,
+        ),
+
+        # ── Add new items above this line ─────────────────────────────────────
+    ])
+
+
+def _action_ntp_sync():
+    invalidate_wifi_cache()
+    if not is_connected():
+        return MsgResult("No internet connection", "Check WiFi and try again.")
+    sync_ntp()
+    return MsgResult("Time synced", "Manual offset cleared.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# GRACEFUL SHUTDOWN
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def _shutdown(sig, frame):
-    print("\nShutting down…")
-    sleep_display()
+    print("\nShutting down...")
+    _sleep_display()
     if _gpio_ok:
-        import RPi.GPIO as GPIO
-        GPIO.cleanup()
+        try:
+            import RPi.GPIO as GPIO
+            GPIO.cleanup()
+        except Exception:
+            pass
     sys.exit(0)
+
 
 signal.signal(signal.SIGINT,  _shutdown)
 signal.signal(signal.SIGTERM, _shutdown)
 
-# ─── Main loop ────────────────────────────────────────────────────────────────
 
-def main():
-    print("=" * 50)
-    print(" Literary Clock — Waveshare 7.5\" / Raspberry Pi")
-    print("=" * 50)
-    init_display()
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN LOOP
+# ═══════════════════════════════════════════════════════════════════════════════
 
+def main() -> None:
+    print("=" * 52)
+    print("  Literary Clock -- Waveshare 7.5\" / Raspberry Pi")
+    print("=" * 52)
+
+    config.load()
+    _reload_fonts()
+    _init_quotes()
+    _setup_buttons()
+    _setup_keyboard()
+    _init_display()
+
+    menu     = build_menu()
+    state    = STATE_CLOCK
     last_key: str | None = None
 
+    edit_h = edit_m = 0
+
+    msg_text    = ""
+    msg_subtext = ""
+    msg_until   = 0.0
+
+    def enter(new_state: str, **kw) -> None:
+        nonlocal state, edit_h, edit_m, msg_text, msg_subtext, msg_until, last_key
+        state = new_state
+        if new_state == STATE_CLOCK:
+            last_key = None
+        elif new_state == STATE_MENU:
+            menu.reset()
+        elif new_state == STATE_SET_H:
+            edit_h, edit_m = get_display_time()
+        elif new_state == STATE_MESSAGE:
+            msg_text    = kw.get("text", "")
+            msg_subtext = kw.get("subtext", "")
+            msg_until   = time.monotonic() + MESSAGE_TTL
+
+    # First paint
+    h, m = get_display_time()
+    _show(render_clock(h, m))
+    _sleep_display()
+    last_key = f"{h:02d}:{m:02d}"
+    print(f"Clock running. btn_menu = GPIO {config.get('btn_menu')} to open menu.")
+
     while True:
-        read_buttons()
-        h, m    = get_display_time()
-        key     = f"{h:02d}:{m:02d}"
+        btn = _next_button()
 
-        if key != last_key:
-            print(f"\n[{key}] Rendering…")
-            img = render_frame(h, m)
-            show_image(img)
-            sleep_display()   # low-power standby between refreshes
-            last_key = key
+        # Auto-expire message
+        if state == STATE_MESSAGE and time.monotonic() >= msg_until:
+            enter(STATE_CLOCK)
 
-        time.sleep(POLL_INTERVAL)
+        # ── CLOCK ─────────────────────────────────────────────────────────────
+        if state == STATE_CLOCK:
+            if btn == "MENU":
+                enter(STATE_MENU)
+                _show(render_menu(menu), fast=True)
+                _sleep_display()
+            else:
+                h, m = get_display_time()
+                key  = f"{h:02d}:{m:02d}"
+                if key != last_key:
+                    print(f"\n[{key}] Rendering...")
+                    _show(render_clock(h, m))
+                    _sleep_display()
+                    last_key = key
+
+        # ── MENU ──────────────────────────────────────────────────────────────
+        elif state == STATE_MENU:
+            if btn == "UP":
+                menu.move(-1)
+                _show(render_menu(menu), fast=True)
+                _sleep_display()
+            elif btn == "DOWN":
+                menu.move(1)
+                _show(render_menu(menu), fast=True)
+                _sleep_display()
+            elif btn == "SELECT":
+                result = menu.select()
+                if isinstance(result, MsgResult):
+                    enter(STATE_MESSAGE, text=result.text, subtext=result.subtext)
+                    _show(render_message(msg_text, msg_subtext), fast=True)
+                    _sleep_display()
+                elif result == STATE_CLOCK:
+                    enter(STATE_CLOCK)
+                    h, m = get_display_time()
+                    _show(render_clock(h, m))
+                    _sleep_display()
+                elif result == STATE_SET_H:
+                    enter(STATE_SET_H)
+                    _show(render_time_set(edit_h, edit_m, "h"), fast=True)
+                    _sleep_display()
+                else:
+                    # None (toggle) — stay in menu, re-render for updated labels
+                    _show(render_menu(menu), fast=True)
+                    _sleep_display()
+            elif btn == "MENU":
+                enter(STATE_CLOCK)
+                h, m = get_display_time()
+                _show(render_clock(h, m))
+                _sleep_display()
+
+        # ── SET TIME: HOURS ───────────────────────────────────────────────────
+        elif state == STATE_SET_H:
+            if btn == "UP":
+                edit_h = (edit_h + 1) % 24
+                _show(render_time_set(edit_h, edit_m, "h"), fast=True)
+                _sleep_display()
+            elif btn == "DOWN":
+                edit_h = (edit_h - 1) % 24
+                _show(render_time_set(edit_h, edit_m, "h"), fast=True)
+                _sleep_display()
+            elif btn == "SELECT":
+                enter(STATE_SET_M)
+                _show(render_time_set(edit_h, edit_m, "m"), fast=True)
+                _sleep_display()
+            elif btn == "MENU":
+                enter(STATE_CLOCK)
+                h, m = get_display_time()
+                _show(render_clock(h, m))
+                _sleep_display()
+
+        # ── SET TIME: MINUTES ─────────────────────────────────────────────────
+        elif state == STATE_SET_M:
+            if btn == "UP":
+                edit_m = (edit_m + 1) % 60
+                _show(render_time_set(edit_h, edit_m, "m"), fast=True)
+                _sleep_display()
+            elif btn == "DOWN":
+                edit_m = (edit_m - 1) % 60
+                _show(render_time_set(edit_h, edit_m, "m"), fast=True)
+                _sleep_display()
+            elif btn == "SELECT":
+                apply_manual_time(edit_h, edit_m)
+                enter(STATE_MESSAGE,
+                      text=f"Time set to {edit_h:02d}:{edit_m:02d}",
+                      subtext="Saved to config.json")
+                _show(render_message(msg_text, msg_subtext), fast=True)
+                _sleep_display()
+            elif btn == "MENU":
+                enter(STATE_CLOCK)
+                h, m = get_display_time()
+                _show(render_clock(h, m))
+                _sleep_display()
+
+        # ── MESSAGE (any button skips the wait) ───────────────────────────────
+        elif state == STATE_MESSAGE:
+            if btn:
+                enter(STATE_CLOCK)
+                h, m = get_display_time()
+                _show(render_clock(h, m))
+                _sleep_display()
+
+        time.sleep(0.05)
 
 
 if __name__ == "__main__":
