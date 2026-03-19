@@ -60,7 +60,7 @@ STATE_MESSAGE = "message"  # brief status screen (auto-exits after MESSAGE_TTL s
 MESSAGE_TTL   = 2.5        # seconds to show a status message
 
 # ── CSV path ───────────────────────────────────────────────────────────────────
-CSV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "quotes.csv")
+CSV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "quotes_merged.csv")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
