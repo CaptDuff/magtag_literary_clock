@@ -63,6 +63,9 @@ MESSAGE_TTL   = 2.5        # seconds to show a status message
 CSV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "quotes_merged.csv")
 
 
+
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # FONT LOADING
 # ═══════════════════════════════════════════════════════════════════════════════
